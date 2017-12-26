@@ -48,7 +48,7 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 			workerChan <- newWorker
 		case worker := <-workerChan:
 			wg.Add(1)
-			go func(worker string, workerChan chan string, taskChan chan int) {
+			go func(worker string) {
 				defer wg.Done()
 				// fmt.Printf("Schedule: scheduling work for worker %s\n", worker)
 				task, ok := <-taskChan
@@ -76,7 +76,7 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 						close(taskChan)
 					}
 				}
-			}(worker, workerChan, taskChan)
+			}(worker)
 		}
 	}
 	wg.Wait()
