@@ -43,6 +43,11 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type LogEntry struct {
+	content interface{}
+	termID  int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -58,13 +63,15 @@ type Raft struct {
 	// Persistant states
 	currentTerm int
 	votedFor    int
-	// log
+	log         []LogEntry
 
 	// Volatile states for all servers
 	commitIndex int
 	lastApplied int
 
 	// Volatile states for leaders
+	nextIndex  []int
+	matchIndex []int
 
 	// Internal states
 	killed         bool
@@ -124,10 +131,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
-	// LastLogIndex int
-	// LastLogTerm int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -163,7 +170,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		go Follower(rf.currentTerm, rf)
 	}
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	// Check not voted
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
+		// Check log up-to-date
+		(len(rf.log) == 0 || rf.log[len(rf.log)-1].termID < args.LastLogTerm ||
+			(rf.log[len(rf.log)-1].termID == args.LastLogTerm &&
+				len(rf.log) <= args.LastLogIndex)) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		DPrintf("Vote %d -> %d", rf.me, args.CandidateId)
@@ -207,9 +219,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-	// TODO other fields
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	// Empty if heartbeat
+	Entry        *interface{}
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -337,7 +353,11 @@ func Candidate(term int, rf *Raft) {
 		votes := 1
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
-				args := &RequestVoteArgs{term, rf.me}
+				termID := 0
+				if len(rf.log) > 0 {
+					termID = rf.log[len(rf.log)-1].termID
+				}
+				args := &RequestVoteArgs{term, rf.me, len(rf.log) - 1, termID}
 				reply := &RequestVoteReply{}
 				go func(t int, server int) {
 					ok := rf.sendRequestVote(server, args, reply)
@@ -393,7 +413,7 @@ func Leader(term int, rf *Raft) {
 		for i := 0; i < len(rf.peers); i++ {
 			// Heartbeats
 			if i != rf.me {
-				args := &AppendEntriesArgs{term, rf.me}
+				args := &AppendEntriesArgs{term, rf.me, 0, 0, nil, rf.commitIndex}
 				reply := &AppendEntriesReply{}
 				go func(t int, server int) {
 					ok := rf.sendAppendEntries(server, args, reply)
@@ -440,8 +460,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// Persistent
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.log = make([]LogEntry, 0)
+	// volatile
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	rf.killed = false
 	//Follower state
