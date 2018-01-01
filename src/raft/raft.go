@@ -259,11 +259,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastActiveTime = time.Now()
 	// Current log doesn't match leader's log, roll back and retry
 	// DPrintf("args.PrevLogIndex : %d", args.PrevLogIndex)
-	if args.Entry != nil && args.PrevLogIndex >= 0 &&
-		(len(rf.log) <= args.PrevLogIndex ||
-			rf.log[args.PrevLogIndex].Term == args.PrevLogTerm) {
+	if len(rf.log) <= args.PrevLogIndex ||
+		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		if args.PrevLogIndex < len(rf.log) {
+			rf.log = rf.log[:args.PrevLogIndex]
+		}
 		return
 	}
 
@@ -293,13 +295,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = append(rf.log, args.Entry[logIdx-args.PrevLogIndex-1])
 		}
 	}
+
 	if args.LeaderCommit > rf.commitIndex {
 		prevIndex := rf.commitIndex + 1
 		currIndex := args.LeaderCommit
-		rf.commitIndex = args.LeaderCommit
+		if currIndex >= len(rf.log) {
+			currIndex = len(rf.log) - 1
+		}
+		rf.commitIndex = currIndex
 		go func() {
 			for idx := prevIndex; idx <= currIndex; idx++ {
 				// We are safe to use rf.log because committed logs will not be changed
+				DPrintf("Server %d commiting : idx %d", rf.me, idx)
 				rf.applyCh <- ApplyMsg{Index: idx,
 					Command: rf.log[idx].Command}
 			}
@@ -336,7 +343,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 	DPrintf("Server %d : Start to commit command at index %d for t%d",
-		rf.me, term, index)
+		rf.me, index, term)
 	rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
 	for i := 0; i < len(rf.peers); i++ {
 		go func(idx int) {
@@ -513,8 +520,8 @@ func LeaderHandler(term int, rf *Raft) {
 		if !ok {
 			return
 		}
-		DPrintf("Server %d : receive notification peer : %d term : %d",
-			rf.me, notify.peer, notify.term)
+		// DPrintf("Server %d : receive notification peer : %d term : %d",
+		//   rf.me, notify.peer, notify.term)
 		rf.mu.Lock()
 		if rf.killed {
 			rf.mu.Unlock()
@@ -522,7 +529,7 @@ func LeaderHandler(term int, rf *Raft) {
 		}
 		// Outdated msg
 		if notify.term != rf.currentTerm {
-			DPrintf("outdated msg")
+			// DPrintf("outdated msg")
 			rf.mu.Unlock()
 			continue
 		}
@@ -537,12 +544,13 @@ func LeaderHandler(term int, rf *Raft) {
 		// Prepare for applying the corresponding log entry
 		index := rf.nextIndex[notify.peer]
 		if index < len(rf.log) {
-			DPrintf("Prepare to sync log entries (%d -> %d) Server (%d -> %d, in t%d)",
-				index, len(rf.log), rf.me, notify.peer, term)
+			// DPrintf("Prepare to sync log entries (%d -> %d) Server (%d -> %d, in t%d)",
+			//   index, len(rf.log), rf.me, notify.peer, term)
 			prevTerm := 0
 			if index > 0 {
 				prevTerm = rf.log[index-1].Term
 			}
+			DPrintf("Server %d : Log len : %d, idx : %d", notify.peer, len(rf.log), index)
 			entries := rf.log[index:]
 			args := &AppendEntriesArgs{term, rf.me, index - 1, prevTerm,
 				entries, rf.commitIndex}
@@ -554,14 +562,14 @@ func LeaderHandler(term int, rf *Raft) {
 }
 
 func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify notifyEntry) {
-	DPrintf("Sync : Server %d -> %d, t%d", rf.me, notify.peer, term)
+	// DPrintf("Sync : Server %d -> %d, t%d", rf.me, notify.peer, term)
 	reply := &AppendEntriesReply{}
 	if rf.me != notify.peer {
 		ok := rf.sendAppendEntries(notify.peer, args, reply)
 		if !ok {
 			go func() {
-				DPrintf("Failed to sync, try again for peer %d in t%d",
-					notify.peer, notify.term)
+				// DPrintf("Failed to sync, try again for peer %d in t%d",
+				//   notify.peer, notify.term)
 				rf.notifyChan <- notify
 			}()
 			return
@@ -585,7 +593,9 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 	// Not success due to conflict
 	if !reply.Success {
 		// decr index and retry
-		rf.nextIndex[notify.peer]--
+		if args.PrevLogIndex < rf.nextIndex[notify.peer] {
+			rf.nextIndex[notify.peer] = args.PrevLogIndex
+		}
 		go func() {
 			rf.notifyChan <- notify
 		}()
@@ -608,7 +618,7 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 			rf.commitIndex = currIndex
 			go func() {
 				for idx := prevIndex; idx <= currIndex; idx++ {
-					DPrintf("Before send : idx %d", idx)
+					DPrintf("Server %d commiting : idx %d", rf.me, idx)
 					rf.applyCh <- ApplyMsg{Index: idx,
 						Command: rf.log[idx].Command}
 				}
