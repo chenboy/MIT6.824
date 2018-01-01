@@ -547,9 +547,7 @@ func LeaderHandler(term int, rf *Raft) {
 			// DPrintf("Prepare to sync log entries (%d -> %d) Server (%d -> %d, in t%d)",
 			//   index, len(rf.log), rf.me, notify.peer, term)
 			prevTerm := 0
-			if index > 0 {
-				prevTerm = rf.log[index-1].Term
-			}
+			prevTerm = rf.log[index-1].Term
 			DPrintf("Server %d : Log len : %d, idx : %d", notify.peer, len(rf.log), index)
 			entries := rf.log[index:]
 			args := &AppendEntriesArgs{term, rf.me, index - 1, prevTerm,
