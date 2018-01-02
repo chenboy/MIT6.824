@@ -29,7 +29,7 @@ import "encoding/gob"
 const HeartBeatInterval = 150 * time.Millisecond
 
 func SetElectionTimeout() time.Duration {
-	return (700 + time.Duration(rand.Int63()%200)) * time.Millisecond
+	return (400 + time.Duration(rand.Int63()%300)) * time.Millisecond
 }
 
 //
@@ -256,6 +256,9 @@ type AppendEntriesReply struct {
 	// Your data here (2A).
 	Term    int
 	Success bool
+	// If rejected due to log conflict, set following 2 members as described in paper
+	ConflictTerm int
+	FirstIndex   int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -277,6 +280,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
+		if len(rf.Log) <= args.PrevLogIndex {
+			reply.FirstIndex = len(rf.Log)
+		} else {
+			reply.ConflictTerm = rf.Log[args.PrevLogIndex].Term
+			reply.FirstIndex = args.PrevLogIndex
+			// TODO: binary search may look fancier here? But useless indeed :-)
+			for reply.FirstIndex > 0 &&
+				rf.Log[reply.FirstIndex-1].Term == reply.ConflictTerm {
+				reply.FirstIndex--
+			}
+		}
 		if args.PrevLogIndex < len(rf.Log) {
 			rf.Log = rf.Log[:args.PrevLogIndex]
 			rf.persist()
@@ -608,7 +622,12 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 	if !reply.Success {
 		// decr index and retry
 		if args.PrevLogIndex < rf.nextIndex[notify.peer] {
-			rf.nextIndex[notify.peer] = args.PrevLogIndex
+			// Back-off to the first conflicting entry we know
+			rf.nextIndex[notify.peer] = reply.FirstIndex
+			for rf.nextIndex[notify.peer] < len(rf.Log) &&
+				rf.Log[rf.nextIndex[notify.peer]].Term == reply.ConflictTerm {
+				rf.nextIndex[notify.peer]++
+			}
 		}
 		go func() {
 			rf.notifyChan <- notify
