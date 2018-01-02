@@ -298,22 +298,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Commit log through the last *NEW* entry if applicable
 	if args.LeaderCommit > rf.commitIndex {
-		prevIndex := rf.commitIndex + 1
-		currIndex := args.LeaderCommit
+		rf.commitIndex = args.LeaderCommit
 		// Check only for entries in sync
-		if currIndex > args.PrevLogIndex+len(args.Entry) {
-			currIndex = args.PrevLogIndex + len(args.Entry)
+		if rf.commitIndex > args.PrevLogIndex+len(args.Entry) {
+			rf.commitIndex = args.PrevLogIndex + len(args.Entry)
 		}
-		rf.commitIndex = currIndex
-		go func() {
-			for idx := prevIndex; idx <= currIndex; idx++ {
-				// We are safe to use rf.log because committed logs will not be changed
-				DPrintf("Server %d commiting : idx %d", rf.me, idx)
-				rf.applyCh <- ApplyMsg{Index: idx,
-					Command: rf.log[idx].Command}
-			}
-		}()
-
 	}
 }
 
@@ -550,7 +539,6 @@ func LeaderHandler(term int, rf *Raft) {
 			// DPrintf("Prepare to sync log entries (%d -> %d) Server (%d -> %d, in t%d)",
 			//   index, len(rf.log), rf.me, notify.peer, term)
 			prevTerm := rf.log[index-1].Term
-			DPrintf("Server %d : Log len : %d, idx : %d", notify.peer, len(rf.log), index)
 			entries := rf.log[index:]
 			args := &AppendEntriesArgs{term, rf.me, index - 1, prevTerm,
 				entries, rf.commitIndex}
@@ -604,7 +592,7 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 	// Update nextIndex, matchIndex and commitIndex
 	if rf.nextIndex[notify.peer] < args.PrevLogIndex+len(args.Entry)+1 {
 		rf.nextIndex[notify.peer] = args.PrevLogIndex + len(args.Entry) + 1
-		rf.matchIndex[notify.peer] = rf.nextIndex[notify.peer]
+		rf.matchIndex[notify.peer] = rf.nextIndex[notify.peer] - 1
 		// Get the lowest idx that gets majority vote
 		sortedMatchIndex := make([]int, len(rf.matchIndex))
 		// DPrintf("matchIndex len %d", len(rf.matchIndex))
@@ -612,19 +600,43 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 		sort.Sort(sort.Reverse(sort.IntSlice(sortedMatchIndex)))
 		// Start a new go routine to commit for current term
 		if sortedMatchIndex[len(sortedMatchIndex)/2] > 0 &&
-			rf.log[sortedMatchIndex[len(sortedMatchIndex)/2]-1].Term == term {
-			prevIndex := rf.commitIndex + 1
-			currIndex := sortedMatchIndex[len(sortedMatchIndex)/2] - 1
-			rf.commitIndex = currIndex
-			go func() {
-				for idx := prevIndex; idx <= currIndex; idx++ {
-					DPrintf("Server %d commiting : idx %d", rf.me, idx)
-					rf.applyCh <- ApplyMsg{Index: idx,
-						Command: rf.log[idx].Command}
-				}
-			}()
+			rf.log[sortedMatchIndex[len(sortedMatchIndex)/2]].Term == term {
+			rf.commitIndex = sortedMatchIndex[len(sortedMatchIndex)/2]
 		}
 	}
+}
+
+// Check if we could apply to the state machine
+func Applier(rf *Raft) {
+	// Interval : at least 50 millisecond
+	const ApplyCheckInterval = 50 * time.Millisecond
+	for {
+		rf.mu.Lock()
+		if rf.killed {
+			rf.mu.Unlock()
+			return
+		}
+		if rf.commitIndex == rf.lastApplied {
+			// Nothing to apply
+			rf.mu.Unlock()
+			time.Sleep(ApplyCheckInterval)
+			continue
+		}
+		prevIndex := rf.lastApplied + 1
+		currIndex := rf.commitIndex
+		commitedLog := rf.log[prevIndex : currIndex+1]
+		rf.lastApplied = rf.commitIndex
+		rf.mu.Unlock()
+		// Do not start a go routine since we want to apply in order
+		// May block here so we do not want to hold the mutex in raft
+		for idx := prevIndex; idx <= currIndex; idx++ {
+			DPrintf("Server %d commiting : idx %d", rf.me, idx)
+			rf.applyCh <- ApplyMsg{Index: idx,
+				Command: commitedLog[idx-prevIndex].Command}
+		}
+		time.Sleep(ApplyCheckInterval)
+	}
+
 }
 
 //
@@ -665,5 +677,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	go Follower(rf.currentTerm, rf)
+	go Applier(rf)
 	return rf
 }
