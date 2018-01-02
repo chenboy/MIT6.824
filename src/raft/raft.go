@@ -296,11 +296,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
+	// Commit log through the last *NEW* entry if applicable
 	if args.LeaderCommit > rf.commitIndex {
 		prevIndex := rf.commitIndex + 1
 		currIndex := args.LeaderCommit
-		if currIndex >= len(rf.log) {
-			currIndex = len(rf.log) - 1
+		// Check only for entries in sync
+		if currIndex > args.PrevLogIndex+len(args.Entry) {
+			currIndex = args.PrevLogIndex + len(args.Entry)
 		}
 		rf.commitIndex = currIndex
 		go func() {
@@ -484,7 +486,8 @@ func Leader(term int, rf *Raft) {
 		for i := 0; i < len(rf.peers); i++ {
 			// Heartbeats
 			if i != rf.me {
-				args := &AppendEntriesArgs{term, rf.me, 0, 0, make([]LogEntry, 0),
+				args := &AppendEntriesArgs{term, rf.me, rf.nextIndex[i] - 1,
+					rf.log[rf.nextIndex[i]-1].Term, make([]LogEntry, 0),
 					rf.commitIndex}
 				reply := &AppendEntriesReply{}
 				go func(t int, server int) {
@@ -546,8 +549,7 @@ func LeaderHandler(term int, rf *Raft) {
 		if index < len(rf.log) {
 			// DPrintf("Prepare to sync log entries (%d -> %d) Server (%d -> %d, in t%d)",
 			//   index, len(rf.log), rf.me, notify.peer, term)
-			prevTerm := 0
-			prevTerm = rf.log[index-1].Term
+			prevTerm := rf.log[index-1].Term
 			DPrintf("Server %d : Log len : %d, idx : %d", notify.peer, len(rf.log), index)
 			entries := rf.log[index:]
 			args := &AppendEntriesArgs{term, rf.me, index - 1, prevTerm,
