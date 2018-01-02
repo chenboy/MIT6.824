@@ -159,7 +159,6 @@ func TestFailNoAgree2B(t *testing.T) {
 	if n > 0 {
 		t.Fatalf("%v committed but no majority", n)
 	}
-	DPrintf("Here")
 
 	// repair
 	cfg.connect((leader + 1) % servers)
