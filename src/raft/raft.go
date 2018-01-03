@@ -295,6 +295,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.Log = rf.Log[:args.PrevLogIndex]
 			rf.persist()
 		}
+		DPrintf("Server %d : reject AppendEntries : ConflictTerm %d FirstIndex %d",
+			rf.me, reply.ConflictTerm, reply.FirstIndex)
 		return
 	}
 
@@ -316,9 +318,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.me, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entry), rf.CurrentTerm)
 	// Apply log if any
 	logChanged := false
-	for logIdx := args.PrevLogIndex + 1; logIdx-args.PrevLogIndex <= len(args.Entry); logIdx++ {
-		if !(logIdx < len(rf.Log)) ||
-			!(rf.Log[logIdx].Term == args.Entry[logIdx-args.PrevLogIndex-1].Term) {
+	for logIdx := args.PrevLogIndex + 1; logIdx <= args.PrevLogIndex+len(args.Entry); logIdx++ {
+		if logIdx >= len(rf.Log) ||
+			rf.Log[logIdx].Term != args.Entry[logIdx-args.PrevLogIndex-1].Term {
 			logChanged = true
 			// Remove all log entries from the point that doesn't match
 			if logIdx < len(rf.Log) {
@@ -368,7 +370,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return index, term, isLeader
 	}
-	DPrintf("Server %d : Start to commit command at index %d for t%d",
+	DPrintf("Server %d : Start() Leader commit command at index %d for t%d",
 		rf.me, index, term)
 	rf.Log = append(rf.Log, LogEntry{command, rf.CurrentTerm})
 	rf.persist()
@@ -669,6 +671,8 @@ func Applier(rf *Raft) {
 		}
 		prevIndex := rf.lastApplied + 1
 		currIndex := rf.commitIndex
+		DPrintf("Server %d : Log len : %d prevIndex : %d currIndex : %d",
+			rf.me, len(rf.Log), prevIndex, currIndex)
 		commitedLog := rf.Log[prevIndex : currIndex+1]
 		rf.lastApplied = rf.commitIndex
 		rf.mu.Unlock()
