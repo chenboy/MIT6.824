@@ -334,7 +334,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// Commit log through the last *NEW* entry if applicable
-	if args.LeaderCommit > rf.commitIndex {
+	if args.LeaderCommit > rf.commitIndex &&
+		// If commitIndex > args.PrevLogIndex + len(args.Entry), current RPC is outdated
+		args.PrevLogIndex+len(args.Entry) > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit
 		// Check only for entries in sync
 		if rf.commitIndex > args.PrevLogIndex+len(args.Entry) {
@@ -370,7 +372,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return index, term, isLeader
 	}
-	DPrintf("Server %d : Start() Leader commit command at index %d for t%d",
+	DPrintf("Server %d : Start() Leader starts to commit command at index %d for t%d",
 		rf.me, index, term)
 	rf.Log = append(rf.Log, LogEntry{command, rf.CurrentTerm})
 	rf.persist()
@@ -418,6 +420,7 @@ func Follower(term int, rf *Raft) {
 			break
 		}
 		// sleep until it is possible to turn into candidate
+		rf.electTimeout = SetElectionTimeout()
 		sleepTime := rf.lastActiveTime.Add(rf.electTimeout + time.Millisecond).Sub(currTime)
 		// DPrintf("Follower(server %d, t%d) Sleep %d ..", rf.me, rf.CurrentTerm, sleepTime)
 		rf.mu.Unlock()
@@ -435,7 +438,7 @@ func Candidate(term int, rf *Raft) {
 			break
 		}
 		if rf.CurrentTerm != term || rf.state != "Candidate" {
-			// Others come in and modify the state
+			// Became leader or follower
 			rf.mu.Unlock()
 			break
 		}
@@ -575,14 +578,13 @@ func LeaderHandler(term int, rf *Raft) {
 			return
 		}
 		// Prepare for applying the corresponding log entry
-		index := rf.nextIndex[notify.peer]
-		if index < len(rf.Log) {
+		if rf.nextIndex[notify.peer] < len(rf.Log) {
 			// DPrintf("Prepare to sync log entries (%d -> %d) Server (%d -> %d, in t%d)",
 			//   index, len(rf.Log), rf.me, notify.peer, term)
-			prevTerm := rf.Log[index-1].Term
-			entries := rf.Log[index:]
-			args := &AppendEntriesArgs{term, rf.me, index - 1, prevTerm,
-				entries, rf.commitIndex}
+			entries := make([]LogEntry, len(rf.Log)-rf.nextIndex[notify.peer])
+			copy(entries, rf.Log[rf.nextIndex[notify.peer]:])
+			args := &AppendEntriesArgs{term, rf.me, rf.nextIndex[notify.peer] - 1,
+				rf.Log[rf.nextIndex[notify.peer]-1].Term, entries, rf.commitIndex}
 			// Try send and get back msg
 			go appendEntryReplyHandler(rf, term, args, notify)
 		}
@@ -610,26 +612,31 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// Outdated
-	if term < reply.Term {
-		if rf.CurrentTerm < reply.Term {
-			rf.CurrentTerm = reply.Term
-			rf.persist()
-			rf.lastActiveTime = time.Now()
-			rf.state = "Follower"
-			go Follower(rf.CurrentTerm, rf)
-		}
+	if rf.CurrentTerm < reply.Term {
+		rf.CurrentTerm = reply.Term
+		rf.persist()
+		rf.lastActiveTime = time.Now()
+		rf.state = "Follower"
+		go Follower(rf.CurrentTerm, rf)
 		return
 	}
-	// Not success due to conflict
+	if term < rf.CurrentTerm {
+		return
+	}
+	// Not successful due to conflict
 	if !reply.Success {
 		// decr index and retry
-		if args.PrevLogIndex < rf.nextIndex[notify.peer] {
+		if args.PrevLogIndex < rf.nextIndex[notify.peer] &&
+			// No others has already succeeded
+			args.PrevLogIndex > rf.matchIndex[notify.peer] {
 			// Back-off to the first conflicting entry we know
 			rf.nextIndex[notify.peer] = reply.FirstIndex
 			for rf.nextIndex[notify.peer] < len(rf.Log) &&
 				rf.Log[rf.nextIndex[notify.peer]].Term == reply.ConflictTerm {
 				rf.nextIndex[notify.peer]++
 			}
+			DPrintf("Server %d : nextIndex[%d] : now %d, len %d",
+				rf.me, notify.peer, rf.nextIndex[notify.peer], len(rf.Log))
 		}
 		go func() {
 			rf.notifyChan <- notify
@@ -637,17 +644,20 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 		return
 	}
 	// Update nextIndex, matchIndex and commitIndex
+	// Note : the current message may be outdated
 	if rf.nextIndex[notify.peer] < args.PrevLogIndex+len(args.Entry)+1 {
+		DPrintf("Server %d : nextIndex[%d] : was %d, now %d, len %d",
+			rf.me, notify.peer, rf.nextIndex[notify.peer],
+			args.PrevLogIndex+len(args.Entry)+1, len(rf.Log))
 		rf.nextIndex[notify.peer] = args.PrevLogIndex + len(args.Entry) + 1
 		rf.matchIndex[notify.peer] = rf.nextIndex[notify.peer] - 1
 		// Get the lowest idx that gets majority vote
 		sortedMatchIndex := make([]int, len(rf.matchIndex))
-		// DPrintf("matchIndex len %d", len(rf.matchIndex))
 		copy(sortedMatchIndex, rf.matchIndex)
 		sort.Sort(sort.Reverse(sort.IntSlice(sortedMatchIndex)))
-		// Start a new go routine to commit for current term
-		if sortedMatchIndex[len(sortedMatchIndex)/2] > 0 &&
-			rf.Log[sortedMatchIndex[len(sortedMatchIndex)/2]].Term == term {
+		if rf.Log[sortedMatchIndex[len(sortedMatchIndex)/2]].Term == term {
+			// DPrintf("Server %d : rf.commitIndex : was %d, now %d",
+			//   rf.me, rf.commitIndex, sortedMatchIndex[len(sortedMatchIndex)/2])
 			rf.commitIndex = sortedMatchIndex[len(sortedMatchIndex)/2]
 		}
 	}
@@ -671,8 +681,8 @@ func Applier(rf *Raft) {
 		}
 		prevIndex := rf.lastApplied + 1
 		currIndex := rf.commitIndex
-		DPrintf("Server %d : Log len : %d prevIndex : %d currIndex : %d",
-			rf.me, len(rf.Log), prevIndex, currIndex)
+		// DPrintf("Server %d : Log len : %d prevIndex : %d currIndex : %d",
+		//   rf.me, len(rf.Log), rf.lastApplied, currIndex)
 		commitedLog := rf.Log[prevIndex : currIndex+1]
 		rf.lastApplied = rf.commitIndex
 		rf.mu.Unlock()
