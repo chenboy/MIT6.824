@@ -29,7 +29,7 @@ import "encoding/gob"
 const HeartBeatInterval = 150 * time.Millisecond
 
 func SetElectionTimeout() time.Duration {
-	return (400 + time.Duration(rand.Int63()%300)) * time.Millisecond
+	return (400 + time.Duration(rand.Int63()%200)) * time.Millisecond
 }
 
 //
@@ -625,10 +625,8 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 	}
 	// Not successful due to conflict
 	if !reply.Success {
-		// decr index and retry
-		if args.PrevLogIndex < rf.nextIndex[notify.peer] &&
-			// No others has already succeeded
-			args.PrevLogIndex > rf.matchIndex[notify.peer] {
+		// decr index and retry if no others has already succeeded
+		if args.PrevLogIndex > rf.matchIndex[notify.peer] {
 			// Back-off to the first conflicting entry we know
 			rf.nextIndex[notify.peer] = reply.FirstIndex
 			for rf.nextIndex[notify.peer] < len(rf.Log) &&
@@ -638,9 +636,11 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 			DPrintf("Server %d : nextIndex[%d] : now %d, len %d",
 				rf.me, notify.peer, rf.nextIndex[notify.peer], len(rf.Log))
 		}
-		go func() {
-			rf.notifyChan <- notify
-		}()
+		if rf.matchIndex[notify.peer]+1 < rf.nextIndex[notify.peer] {
+			go func() {
+				rf.notifyChan <- notify
+			}()
+		}
 		return
 	}
 	// Update nextIndex, matchIndex and commitIndex
