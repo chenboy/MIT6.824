@@ -490,6 +490,7 @@ func Candidate(term int, rf *Raft) {
 						votes += 1
 						if votes == len(rf.peers)/2+1 {
 							rf.state = "Leader"
+							rf.leaderId = rf.me
 							rf.nextIndex = make([]int, len(rf.peers))
 							rf.matchIndex = make([]int, len(rf.peers))
 							for i := 0; i < len(rf.peers); i++ {

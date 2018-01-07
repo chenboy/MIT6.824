@@ -87,6 +87,7 @@ func (kv *RaftKV) RegisterCallback(op Op) chan Notify {
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
+	reply.ServerID = kv.me
 	entry, ok := kv.lastCommit[args.ClientID]
 	if ok && entry.SeqNo > args.SeqNo {
 		// Outdated request, do not need to do anything, since the client already
@@ -129,6 +130,8 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
+	DPrintf("Server %d : %s(%s, %s)", kv.me, args.Op, args.Key, args.Value)
+	reply.ServerID = kv.me
 	entry, ok := kv.lastCommit[args.ClientID]
 	if ok && entry.SeqNo > args.SeqNo {
 		// Outdated request, do not need to do anything, since the client already
@@ -148,6 +151,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if notifyChan == nil {
 		reply.WrongLeader = true
 		reply.LeaderID = kv.rf.GetLeaderId()
+		DPrintf("Server %d : Wrong Leader(%d)", kv.me, reply.LeaderID)
 		kv.mu.Unlock()
 		return
 	}
@@ -194,32 +198,29 @@ func (kv *RaftKV) MainLoop() {
 			switch op.Op {
 			case "Put":
 				kv.kvStore[op.Key] = op.Value
+				entry.Value = op.Value
 				entry.Err = OK
-			case "PutAppend":
+			case "Append":
 				value := kv.kvStore[op.Key]
 				kv.kvStore[op.Key] = value + op.Value
+				entry.Value = value + op.Value
 				entry.Err = OK
 			case "Get":
 				entry.Err = OK
 				value, ok := kv.kvStore[op.Key]
 				if !ok {
-					notify.Err = ErrNoKey
 					entry.Err = ErrNoKey
 				}
-				notify.Value = value
 				entry.Value = value
 			}
 			kv.lastCommit[op.ClientID] = entry
+			notify.Value = entry.Value
+			notify.Err = entry.Err
 		} else if oldEntry.SeqNo == op.SeqNo {
 			// Client may resend the same operation because it does not know the previous
 			// one succeeded, so we just send previous result back
-			switch op.Op {
-			case "Put":
-			case "PutAppend":
-			case "Get":
-				notify.Value = oldEntry.Value
-				notify.Err = oldEntry.Err
-			}
+			notify.Value = oldEntry.Value
+			notify.Err = oldEntry.Err
 		}
 		// Send over channel and then free space
 		chans := kv.notifyChans[msg.Index]
@@ -262,5 +263,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastCommit = make(map[int]lastCommitEntry)
 	kv.kvStore = make(map[string]string)
 	kv.killed = false
+	kv.notifyChans = make(map[int][]chan Notify)
+	go kv.MainLoop()
 	return kv
 }

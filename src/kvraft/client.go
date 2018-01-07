@@ -10,6 +10,10 @@ type Clerk struct {
 	clientID int
 	seqNo    int
 	leader   int
+	// map (server ID -> index in the array)
+	indexByServer map[int]int
+	// Servers we do not know ID yet
+	unknownIndex []int
 }
 
 func nrand() int64 {
@@ -28,7 +32,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// (may not need to go through raft to get client id)
 	ck.clientID = int(nrand())
 	ck.leader = -1
+	ck.indexByServer = make(map[int]int)
+	ck.unknownIndex = make([]int, len(servers))
+	for idx := 0; idx < len(servers); idx++ {
+		ck.unknownIndex[idx] = idx
+	}
 	return ck
+}
+
+func (ck *Clerk) RegisterServer(idx int, server int) {
+	// If we do not know this index yet, record it
+	for i := 0; i < len(ck.unknownIndex); i++ {
+		if idx == ck.unknownIndex[i] {
+			ck.indexByServer[server] = idx
+			lastIdx := len(ck.unknownIndex) - 1
+			DPrintf("idx : %d, last : %d", idx, lastIdx)
+			// Remove idx from unknown index
+			ck.unknownIndex[i], ck.unknownIndex[lastIdx] =
+				ck.unknownIndex[lastIdx], ck.unknownIndex[i]
+			ck.unknownIndex = ck.unknownIndex[:lastIdx]
+		}
+	}
+
 }
 
 //
@@ -52,15 +77,25 @@ func (ck *Clerk) Get(key string) string {
 		DPrintf("Client %d : Get(%s)", ck.clientID, key)
 		reply := GetReply{}
 		var ok bool
+		var idx int
 		if ck.leader == -1 {
-			ok = ck.servers[int(nrand())%len(ck.servers)].Call(
+			idx = int(nrand()) % len(ck.servers)
+			ok = ck.servers[idx].Call(
 				"RaftKV.Get", &args, &reply)
 		} else {
-			ok = ck.servers[ck.leader].Call("RaftKV.Get", &args, &reply)
+			DPrintf("Client %d : Send to server %d", ck.clientID, ck.leader)
+			var hasKey bool
+			idx, hasKey = ck.indexByServer[ck.leader]
+			if !hasKey {
+				idx = ck.unknownIndex[int(nrand())%len(ck.unknownIndex)]
+			}
+			ok = ck.servers[idx].Call("RaftKV.Get", &args, &reply)
 		}
 		if !ok {
+			ck.leader = -1
 			continue
 		}
+		ck.RegisterServer(idx, reply.ServerID)
 		if reply.WrongLeader {
 			ck.leader = reply.LeaderID
 			continue
@@ -92,17 +127,28 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		DPrintf("Client %d : %s(%s, %s)", ck.clientID, op, key, value)
 		reply := PutAppendReply{}
 		var ok bool
+		var idx int
 		if ck.leader == -1 {
-			ok = ck.servers[int(nrand())%len(ck.servers)].Call(
+			idx = int(nrand()) % len(ck.servers)
+			ok = ck.servers[idx].Call(
 				"RaftKV.PutAppend", &args, &reply)
 		} else {
-			ok = ck.servers[ck.leader].Call("RaftKV.PutAppend", &args, &reply)
+			DPrintf("Client %d : Send to server %d", ck.clientID, ck.leader)
+			var hasKey bool
+			idx, hasKey = ck.indexByServer[ck.leader]
+			if !hasKey {
+				idx = ck.unknownIndex[int(nrand())%len(ck.unknownIndex)]
+			}
+			ok = ck.servers[idx].Call("RaftKV.PutAppend", &args, &reply)
 		}
 		if !ok {
+			ck.leader = -1
 			continue
 		}
+		ck.RegisterServer(idx, reply.ServerID)
 		if reply.WrongLeader {
 			ck.leader = reply.LeaderID
+			DPrintf("Client %d : leader %d", ck.clientID, ck.leader)
 			continue
 		}
 		break
