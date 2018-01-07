@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -157,7 +157,9 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.mu.Unlock()
 	defer close(notifyChan)
+	// DPrintf("Server %d : PutAppend() Wait for reply", kv.me)
 	notify := <-notifyChan
+	// DPrintf("Server %d : PutAppend() Got reply", kv.me)
 	if notify.ClientID != args.ClientID || notify.SeqNo != args.SeqNo {
 		// For some reason (maybe leader change), the log has not committed
 		reply.WrongLeader = true
@@ -190,6 +192,7 @@ func (kv *RaftKV) MainLoop() {
 		kv.mu.Lock()
 		// New op, the state machine should apply
 		notify := Notify{op.ClientID, op.SeqNo, "", OK}
+		// DPrintf("Server %d : got %s(%d)", kv.me, op.Op, op.SeqNo)
 		oldEntry, ok := kv.lastCommit[op.ClientID]
 		if !ok || oldEntry.SeqNo == op.SeqNo-1 {
 			// The new entry is the one to apply

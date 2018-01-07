@@ -3,6 +3,7 @@ package raftkv
 import "labrpc"
 import "crypto/rand"
 import "math/big"
+import "time"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -56,6 +57,22 @@ func (ck *Clerk) RegisterServer(idx int, server int) {
 
 }
 
+const RPC_TIMEOUT = 2 * time.Second
+
+// Add timeout to prevent block
+func (ck *Clerk) SendGet(rpc string, idx int, args interface{}, reply interface{}) bool {
+	okCh := make(chan bool, 1)
+	go func() {
+		ok := ck.servers[idx].Call(rpc, args, reply)
+		okCh <- ok
+	}()
+	go func() {
+		time.Sleep(RPC_TIMEOUT)
+		okCh <- false
+	}()
+	return <-okCh
+}
+
 //
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -80,17 +97,15 @@ func (ck *Clerk) Get(key string) string {
 		var idx int
 		if ck.leader == -1 {
 			idx = int(nrand()) % len(ck.servers)
-			ok = ck.servers[idx].Call(
-				"RaftKV.Get", &args, &reply)
 		} else {
-			DPrintf("Client %d : Send to server %d", ck.clientID, ck.leader)
+			DPrintf("Client %d(%d) : Send to server %d", ck.clientID, ck.seqNo, ck.leader)
 			var hasKey bool
 			idx, hasKey = ck.indexByServer[ck.leader]
 			if !hasKey {
 				idx = ck.unknownIndex[int(nrand())%len(ck.unknownIndex)]
 			}
-			ok = ck.servers[idx].Call("RaftKV.Get", &args, &reply)
 		}
+		ok = ck.SendGet("RaftKV.Get", idx, &args, &reply)
 		if !ok {
 			ck.leader = -1
 			continue
@@ -130,17 +145,15 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		var idx int
 		if ck.leader == -1 {
 			idx = int(nrand()) % len(ck.servers)
-			ok = ck.servers[idx].Call(
-				"RaftKV.PutAppend", &args, &reply)
 		} else {
-			DPrintf("Client %d : Send to server %d", ck.clientID, ck.leader)
+			DPrintf("Client %d(%d) : %s(%s, %s)", ck.clientID, ck.seqNo, op, key, value)
 			var hasKey bool
 			idx, hasKey = ck.indexByServer[ck.leader]
 			if !hasKey {
 				idx = ck.unknownIndex[int(nrand())%len(ck.unknownIndex)]
 			}
-			ok = ck.servers[idx].Call("RaftKV.PutAppend", &args, &reply)
 		}
+		ok = ck.SendGet("RaftKV.PutAppend", idx, &args, &reply)
 		if !ok {
 			ck.leader = -1
 			continue
