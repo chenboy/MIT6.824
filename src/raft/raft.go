@@ -84,6 +84,7 @@ type Raft struct {
 	electTimeout   time.Duration
 	lastActiveTime time.Time
 	state          string
+	leaderId       int
 	// Channel do not need to be protected by the mutex
 	// Peer no to send for the leader
 	notifyChan chan notifyEntry
@@ -274,6 +275,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.lastActiveTime = time.Now()
+	rf.leaderId = args.LeaderId
 	// Current log doesn't match leader's log, roll back and retry
 	// DPrintf("args.PrevLogIndex : %d", args.PrevLogIndex)
 	if len(rf.Log) <= args.PrevLogIndex ||
@@ -398,6 +400,12 @@ func (rf *Raft) Kill() {
 	// close(rf.notifyChan)
 }
 
+func (rf *Raft) GetLeaderId() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.leaderId
+}
+
 func Follower(term int, rf *Raft) {
 	DPrintf("Follower(Server %d, t%d)", rf.me, term)
 	for {
@@ -445,6 +453,7 @@ func Candidate(term int, rf *Raft) {
 		term += 1
 		rf.CurrentTerm += 1
 		rf.persist()
+		rf.leaderId = -1
 		rf.electTimeout = SetElectionTimeout()
 		DPrintf("Candidate(Server %d, t%d) ", rf.me, term)
 		// Vote for self

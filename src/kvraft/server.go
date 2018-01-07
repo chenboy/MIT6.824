@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -78,7 +78,7 @@ func (kv *RaftKV) RegisterCallback(op Op) chan Notify {
 	if !ok {
 		chans = make([]chan Notify, 0)
 	}
-	// Only the main loop will send to the channel *once*
+	// Only the main loop will send to the channel *once* when the index commit
 	chans = append(chans, make(chan Notify, 1))
 	kv.notifyChans[index] = chans
 	return chans[len(chans)-1]
@@ -102,11 +102,11 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	}
-	op := Op{args.Key, "", args.Key, args.ClientID, args.SeqNo}
+	op := Op{args.Key, "", "Get", args.ClientID, args.SeqNo}
 	notifyChan := kv.RegisterCallback(op)
 	if notifyChan == nil {
-		// TODO send back the actual leader
 		reply.WrongLeader = true
+		reply.LeaderID = kv.rf.GetLeaderId()
 		kv.mu.Unlock()
 		return
 	}
@@ -115,8 +115,8 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	notify := <-notifyChan
 	if notify.ClientID != args.ClientID || notify.SeqNo != args.SeqNo {
 		// For some reason (maybe leader change), the log has not committed
-		// TODO send back the actual leader
 		reply.WrongLeader = true
+		reply.LeaderID = kv.rf.GetLeaderId()
 		return
 	}
 
@@ -146,8 +146,8 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op := Op{args.Key, args.Value, args.Op, args.ClientID, args.SeqNo}
 	notifyChan := kv.RegisterCallback(op)
 	if notifyChan == nil {
-		// TODO send back the actual leader
 		reply.WrongLeader = true
+		reply.LeaderID = kv.rf.GetLeaderId()
 		kv.mu.Unlock()
 		return
 	}
@@ -156,8 +156,8 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	notify := <-notifyChan
 	if notify.ClientID != args.ClientID || notify.SeqNo != args.SeqNo {
 		// For some reason (maybe leader change), the log has not committed
-		// TODO send back the actual leader
 		reply.WrongLeader = true
+		reply.LeaderID = kv.rf.GetLeaderId()
 		return
 	}
 
