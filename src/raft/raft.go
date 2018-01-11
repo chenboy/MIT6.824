@@ -26,10 +26,11 @@ import "math/rand"
 import "bytes"
 import "encoding/gob"
 
-const HeartBeatInterval = 150 * time.Millisecond
+const HeartBeatInterval = 120 * time.Millisecond
+const RPCTimeout = 1 * time.Second
 
 func SetElectionTimeout() time.Duration {
-	return (400 + time.Duration(rand.Int63()%200)) * time.Millisecond
+	return (800 + time.Duration(rand.Int63()%200)) * time.Millisecond
 }
 
 //
@@ -239,8 +240,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	return rf.peers[server].Call("Raft.RequestVote", args, reply)
 }
 
 type AppendEntriesArgs struct {
@@ -348,8 +348,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
+	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
 //
@@ -635,17 +634,21 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 	}
 	// Not successful due to conflict
 	if !reply.Success {
-		// decr index and retry if no others has already succeeded
+		// decr index and retry if no others has already succeeded or failed before us
 		if args.PrevLogIndex > rf.matchIndex[notify.peer] {
-			// Back-off to the first conflicting entry we know
+			// Back-off to the first conflicting entry we know, note that others may have
+			// already updated matchIndex & nextIndex but they may be slightly outdated
+			// so this rpc may still want to retry
 			rf.nextIndex[notify.peer] = reply.FirstIndex
 			for rf.nextIndex[notify.peer] < len(rf.Log) &&
-				rf.Log[rf.nextIndex[notify.peer]].Term == reply.ConflictTerm {
+				(rf.nextIndex[notify.peer] < rf.matchIndex[notify.peer]+1 ||
+					rf.Log[rf.nextIndex[notify.peer]].Term == reply.ConflictTerm) {
 				rf.nextIndex[notify.peer]++
 			}
 			DPrintf("Server %d : nextIndex[%d] : now %d, len %d",
 				rf.me, notify.peer, rf.nextIndex[notify.peer], len(rf.Log))
 		}
+		// Retry if needed
 		if rf.matchIndex[notify.peer]+1 < rf.nextIndex[notify.peer] {
 			go func() {
 				rf.notifyChan <- notify
@@ -655,12 +658,14 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 	}
 	// Update nextIndex, matchIndex and commitIndex
 	// Note : the current message may be outdated
-	if rf.nextIndex[notify.peer] < args.PrevLogIndex+len(args.Entry)+1 {
+	if rf.matchIndex[notify.peer] < args.PrevLogIndex+len(args.Entry) {
 		DPrintf("Server %d : nextIndex[%d] : was %d, now %d, len %d",
 			rf.me, notify.peer, rf.nextIndex[notify.peer],
 			args.PrevLogIndex+len(args.Entry)+1, len(rf.Log))
-		rf.nextIndex[notify.peer] = args.PrevLogIndex + len(args.Entry) + 1
-		rf.matchIndex[notify.peer] = rf.nextIndex[notify.peer] - 1
+		rf.matchIndex[notify.peer] = args.PrevLogIndex + len(args.Entry)
+		if rf.matchIndex[notify.peer]+1 > rf.nextIndex[notify.peer] {
+			rf.nextIndex[notify.peer] = rf.matchIndex[notify.peer] + 1
+		}
 		// Get the lowest idx that gets majority vote
 		sortedMatchIndex := make([]int, len(rf.matchIndex))
 		copy(sortedMatchIndex, rf.matchIndex)

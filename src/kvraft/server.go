@@ -108,16 +108,17 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	if notifyChan == nil {
 		reply.WrongLeader = true
 		reply.LeaderID = kv.rf.GetLeaderId()
+		DPrintf("Server %d : Wrong Leader(%d)", kv.me, reply.LeaderID)
 		kv.mu.Unlock()
 		return
 	}
 	kv.mu.Unlock()
-	defer close(notifyChan)
 	notify := <-notifyChan
 	if notify.ClientID != args.ClientID || notify.SeqNo != args.SeqNo {
 		// For some reason (maybe leader change), the log has not committed
 		reply.WrongLeader = true
 		reply.LeaderID = kv.rf.GetLeaderId()
+		DPrintf("Server %d : Wrong Leader(%d)", kv.me, reply.LeaderID)
 		return
 	}
 
@@ -164,6 +165,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		// For some reason (maybe leader change), the log has not committed
 		reply.WrongLeader = true
 		reply.LeaderID = kv.rf.GetLeaderId()
+		DPrintf("Server %d : Wrong Leader(%d)", kv.me, reply.LeaderID)
 		return
 	}
 

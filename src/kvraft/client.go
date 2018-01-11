@@ -57,10 +57,10 @@ func (ck *Clerk) RegisterServer(idx int, server int) {
 
 }
 
-const RPC_TIMEOUT = 2 * time.Second
+const RPC_TIMEOUT = 500 * time.Millisecond
 
 // Add timeout to prevent block
-func (ck *Clerk) SendGet(rpc string, idx int, args interface{}, reply interface{}) bool {
+func (ck *Clerk) SendRPC(rpc string, idx int, args interface{}, reply interface{}) bool {
 	okCh := make(chan bool, 1)
 	go func() {
 		ok := ck.servers[idx].Call(rpc, args, reply)
@@ -91,7 +91,7 @@ func (ck *Clerk) Get(key string) string {
 	ck.seqNo++
 	args := GetArgs{key, ck.clientID, seqNo}
 	for {
-		DPrintf("Client %d : Get(%s)", ck.clientID, key)
+		DPrintf("Client %d(%d) : Get(%s)", ck.clientID, ck.seqNo, key)
 		reply := GetReply{}
 		var ok bool
 		var idx int
@@ -105,9 +105,10 @@ func (ck *Clerk) Get(key string) string {
 				idx = ck.unknownIndex[int(nrand())%len(ck.unknownIndex)]
 			}
 		}
-		ok = ck.SendGet("RaftKV.Get", idx, &args, &reply)
+		ok = ck.SendRPC("RaftKV.Get", idx, &args, &reply)
 		if !ok {
 			ck.leader = -1
+			// DPrintf("Client %d(%d) : Retry", ck.clientID, ck.seqNo)
 			continue
 		}
 		ck.RegisterServer(idx, reply.ServerID)
@@ -153,7 +154,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				idx = ck.unknownIndex[int(nrand())%len(ck.unknownIndex)]
 			}
 		}
-		ok = ck.SendGet("RaftKV.PutAppend", idx, &args, &reply)
+		ok = ck.SendRPC("RaftKV.PutAppend", idx, &args, &reply)
 		if !ok {
 			ck.leader = -1
 			continue
@@ -161,7 +162,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ck.RegisterServer(idx, reply.ServerID)
 		if reply.WrongLeader {
 			ck.leader = reply.LeaderID
-			DPrintf("Client %d : leader %d", ck.clientID, ck.leader)
 			continue
 		}
 		break
