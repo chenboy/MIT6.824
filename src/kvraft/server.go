@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/gob"
 	"labrpc"
 	"log"
@@ -37,7 +38,7 @@ type Notify struct {
 	Value string
 	Err   Err
 }
-type lastCommitEntry struct {
+type LastCommitEntry struct {
 	SeqNo int
 	// In case client retry
 	Err   Err
@@ -45,18 +46,22 @@ type lastCommitEntry struct {
 }
 
 type RaftKV struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+	mu        sync.Mutex
+	me        int
+	rf        *raft.Raft
+	persister *raft.Persister
+	applyCh   chan raft.ApplyMsg
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
-	kvStore map[string]string
+	// KvStore and LastCommit needs to be saved in a snapshot(together with prevTerm
+	// and prevIndex which are needed in raft)
+	KvStore map[string]string
 	// The last SeqNo a client has committed, since a client will retry
 	// indefinitely, we're guaranteed to commit each clients command in SeqNo order
-	lastCommit map[int]lastCommitEntry
+	LastCommit map[int]LastCommitEntry
+	PrevTerm   int
+	PrevIndex  int
 
 	// Map index -> list of RPC waiting for
 	// All RPC resulting in modifying some index of the map must be guaranteed
@@ -88,7 +93,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	reply.ServerID = kv.me
-	entry, ok := kv.lastCommit[args.ClientID]
+	entry, ok := kv.LastCommit[args.ClientID]
 	if ok && entry.SeqNo > args.SeqNo {
 		// Outdated request, do not need to do anything, since the client already
 		// timeout
@@ -133,7 +138,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	DPrintf("Server %d : %s(%s, %s)", kv.me, args.Op, args.Key, args.Value)
 	reply.ServerID = kv.me
-	entry, ok := kv.lastCommit[args.ClientID]
+	entry, ok := kv.LastCommit[args.ClientID]
 	if ok && entry.SeqNo > args.SeqNo {
 		// Outdated request, do not need to do anything, since the client already
 		// timeout
@@ -195,30 +200,30 @@ func (kv *RaftKV) MainLoop() {
 		// New op, the state machine should apply
 		notify := Notify{op.ClientID, op.SeqNo, "", OK}
 		// DPrintf("Server %d : got %s(%d)", kv.me, op.Op, op.SeqNo)
-		oldEntry, ok := kv.lastCommit[op.ClientID]
+		oldEntry, ok := kv.LastCommit[op.ClientID]
 		if !ok || oldEntry.SeqNo == op.SeqNo-1 {
 			// The new entry is the one to apply
-			var entry lastCommitEntry
+			var entry LastCommitEntry
 			entry.SeqNo = op.SeqNo
 			switch op.Op {
 			case "Put":
-				kv.kvStore[op.Key] = op.Value
+				kv.KvStore[op.Key] = op.Value
 				entry.Value = op.Value
 				entry.Err = OK
 			case "Append":
-				value := kv.kvStore[op.Key]
-				kv.kvStore[op.Key] = value + op.Value
+				value := kv.KvStore[op.Key]
+				kv.KvStore[op.Key] = value + op.Value
 				entry.Value = value + op.Value
 				entry.Err = OK
 			case "Get":
 				entry.Err = OK
-				value, ok := kv.kvStore[op.Key]
+				value, ok := kv.KvStore[op.Key]
 				if !ok {
 					entry.Err = ErrNoKey
 				}
 				entry.Value = value
 			}
-			kv.lastCommit[op.ClientID] = entry
+			kv.LastCommit[op.ClientID] = entry
 			notify.Value = entry.Value
 			notify.Err = entry.Err
 		} else if oldEntry.SeqNo == op.SeqNo {
@@ -235,6 +240,29 @@ func (kv *RaftKV) MainLoop() {
 		delete(kv.notifyChans, msg.Index)
 		kv.mu.Unlock()
 	}
+}
+
+func (kv *RaftKV) saveSnapshot() {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(kv.KvStore)
+	e.Encode(kv.LastCommit)
+	e.Encode(kv.PrevIndex)
+	e.Encode(kv.PrevTerm)
+	data := w.Bytes()
+	kv.persister.SaveSnapshot(data)
+}
+
+func (kv *RaftKV) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&kv.KvStore)
+	d.Decode(&kv.LastCommit)
+	d.Decode(&kv.PrevIndex)
+	d.Decode(&kv.PrevTerm)
 }
 
 //
@@ -254,21 +282,24 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call gob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	gob.Register(Op{})
+	gob.Register(LastCommitEntry{})
 
 	kv := new(RaftKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.LastCommit = make(map[int]LastCommitEntry)
+	kv.KvStore = make(map[string]string)
+	kv.killed = false
+	kv.notifyChans = make(map[int][]chan Notify)
+	kv.persister = persister
+	kv.PrevTerm = 0
+	kv.PrevIndex = 0
+	kv.readSnapshot(persister.ReadSnapshot())
+	go kv.MainLoop()
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	// You may need initialization code here.
-	kv.lastCommit = make(map[int]lastCommitEntry)
-	kv.kvStore = make(map[string]string)
-	kv.killed = false
-	kv.notifyChans = make(map[int][]chan Notify)
-	go kv.MainLoop()
 	return kv
 }

@@ -71,6 +71,8 @@ type Raft struct {
 	CurrentTerm int
 	VotedFor    int
 	Log         []LogEntry
+	// This is in fact the first index in the log, i.e. the offset
+	FirstIndex int
 
 	// Volatile states for all servers
 	commitIndex int
@@ -125,6 +127,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.Log)
+	e.Encode(rf.FirstIndex)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -147,6 +150,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.CurrentTerm)
 	d.Decode(&rf.VotedFor)
 	d.Decode(&rf.Log)
+	d.Decode(&rf.FirstIndex)
 }
 
 //
@@ -200,7 +204,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// Check log up-to-date
 		(rf.Log[len(rf.Log)-1].Term < args.LastLogTerm ||
 			(rf.Log[len(rf.Log)-1].Term == args.LastLogTerm &&
-				len(rf.Log)-1 <= args.LastLogIndex)) {
+				rf.FirstIndex+len(rf.Log)-1 <= args.LastLogIndex)) {
 		rf.VotedFor = args.CandidateId
 		rf.persist()
 		reply.VoteGranted = true
@@ -276,26 +280,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.lastActiveTime = time.Now()
 	rf.leaderId = args.LeaderId
+	// The leader's message may have delayed, we do not consider commited log entries
+	if args.PrevLogIndex < rf.FirstIndex {
+		// Trim entries
+		if args.PrevLogIndex+len(args.Entry) > rf.FirstIndex {
+			args.Entry = args.Entry[rf.FirstIndex-args.PrevLogIndex:]
+		} else {
+			args.Entry = make([]LogEntry, 0)
+		}
+		args.PrevLogIndex = rf.FirstIndex
+		args.PrevLogTerm = rf.Log[0].Term
+	}
 	// Current log doesn't match leader's log, roll back and retry
 	// DPrintf("args.PrevLogIndex : %d", args.PrevLogIndex)
-	if len(rf.Log) <= args.PrevLogIndex ||
-		rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.FirstIndex+len(rf.Log) <= args.PrevLogIndex ||
+		rf.Log[args.PrevLogIndex-rf.FirstIndex].Term != args.PrevLogTerm {
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
-		if len(rf.Log) <= args.PrevLogIndex {
-			reply.FirstIndex = len(rf.Log)
+		if rf.FirstIndex+len(rf.Log) <= args.PrevLogIndex {
+			// Current log is not long enough
+			reply.FirstIndex = rf.FirstIndex + len(rf.Log)
 		} else {
-			reply.ConflictTerm = rf.Log[args.PrevLogIndex].Term
+			reply.ConflictTerm = rf.Log[args.PrevLogIndex-rf.FirstIndex].Term
 			reply.FirstIndex = args.PrevLogIndex
 			// TODO: binary search may look fancier here? But useless indeed :-)
-			for reply.FirstIndex > 0 &&
-				rf.Log[reply.FirstIndex-1].Term == reply.ConflictTerm {
+			for reply.FirstIndex > rf.FirstIndex &&
+				rf.Log[reply.FirstIndex-rf.FirstIndex-1].Term == reply.ConflictTerm {
 				reply.FirstIndex--
 			}
-		}
-		if args.PrevLogIndex < len(rf.Log) {
-			rf.Log = rf.Log[:args.PrevLogIndex]
-			rf.persist()
 		}
 		DPrintf("Server %d : reject AppendEntries : ConflictTerm %d FirstIndex %d",
 			rf.me, reply.ConflictTerm, reply.FirstIndex)
@@ -305,7 +317,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = args.Term
 	reply.Success = true
 
-	// DPrintf("Server %d : receive heartbeat", rf.me)
 	// Set state
 	if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
@@ -322,11 +333,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	logChanged := false
 	for logIdx := args.PrevLogIndex + 1; logIdx <= args.PrevLogIndex+len(args.Entry); logIdx++ {
 		if logIdx >= len(rf.Log) ||
-			rf.Log[logIdx].Term != args.Entry[logIdx-args.PrevLogIndex-1].Term {
+			rf.Log[logIdx-rf.FirstIndex].Term != args.Entry[logIdx-args.PrevLogIndex-1].Term {
 			logChanged = true
 			// Remove all log entries from the point that doesn't match
-			if logIdx < len(rf.Log) {
-				rf.Log = rf.Log[:logIdx]
+			if logIdx-rf.FirstIndex < len(rf.Log) {
+				rf.Log = rf.Log[:logIdx-rf.FirstIndex]
 			}
 			rf.Log = append(rf.Log, args.Entry[logIdx-args.PrevLogIndex-1])
 		}
@@ -462,7 +473,7 @@ func Candidate(term int, rf *Raft) {
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
 				Term := rf.Log[len(rf.Log)-1].Term
-				args := &RequestVoteArgs{term, rf.me, len(rf.Log) - 1, Term}
+				args := &RequestVoteArgs{term, rf.me, rf.FirstIndex + len(rf.Log) - 1, Term}
 				reply := &RequestVoteReply{}
 				go func(t int, server int) {
 					ok := rf.sendRequestVote(server, args, reply)
@@ -493,7 +504,8 @@ func Candidate(term int, rf *Raft) {
 							rf.nextIndex = make([]int, len(rf.peers))
 							rf.matchIndex = make([]int, len(rf.peers))
 							for i := 0; i < len(rf.peers); i++ {
-								rf.nextIndex[i] = len(rf.Log)
+								rf.nextIndex[i] = rf.FirstIndex + len(rf.Log)
+								rf.matchIndex[i] = rf.FirstIndex
 							}
 							go LeaderHandler(t, rf)
 							go Leader(t, rf)
@@ -528,7 +540,7 @@ func Leader(term int, rf *Raft) {
 			// Heartbeats
 			if i != rf.me {
 				args := &AppendEntriesArgs{term, rf.me, rf.nextIndex[i] - 1,
-					rf.Log[rf.nextIndex[i]-1].Term, make([]LogEntry, 0),
+					rf.Log[rf.nextIndex[i]-1-rf.FirstIndex].Term, make([]LogEntry, 0),
 					rf.commitIndex}
 				reply := &AppendEntriesReply{}
 				go func(t int, server int) {
@@ -586,14 +598,16 @@ func LeaderHandler(term int, rf *Raft) {
 			rf.mu.Unlock()
 			return
 		}
+		// TODO (check if we need to send snapshot)
 		// Prepare for applying the corresponding log entry
-		if rf.nextIndex[notify.peer] < len(rf.Log) {
+		if rf.nextIndex[notify.peer] < rf.FirstIndex+len(rf.Log) {
 			// DPrintf("Prepare to sync log entries (%d -> %d) Server (%d -> %d, in t%d)",
 			//   index, len(rf.Log), rf.me, notify.peer, term)
-			entries := make([]LogEntry, len(rf.Log)-rf.nextIndex[notify.peer])
-			copy(entries, rf.Log[rf.nextIndex[notify.peer]:])
+			entries := make([]LogEntry, rf.FirstIndex+len(rf.Log)-rf.nextIndex[notify.peer])
+			copy(entries, rf.Log[rf.nextIndex[notify.peer]-rf.FirstIndex:])
 			args := &AppendEntriesArgs{term, rf.me, rf.nextIndex[notify.peer] - 1,
-				rf.Log[rf.nextIndex[notify.peer]-1].Term, entries, rf.commitIndex}
+				rf.Log[rf.nextIndex[notify.peer]-rf.FirstIndex-1].Term, entries,
+				rf.commitIndex}
 			// Try send and get back msg
 			go appendEntryReplyHandler(rf, term, args, notify)
 		}
@@ -608,8 +622,6 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 		ok := rf.sendAppendEntries(notify.peer, args, reply)
 		if !ok {
 			go func() {
-				// DPrintf("Failed to sync, try again for peer %d in t%d",
-				//   notify.peer, notify.term)
 				rf.notifyChan <- notify
 			}()
 			return
@@ -639,14 +651,20 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 			// Back-off to the first conflicting entry we know, note that others may have
 			// already updated matchIndex & nextIndex but they may be slightly outdated
 			// so this rpc may still want to retry
-			rf.nextIndex[notify.peer] = reply.FirstIndex
-			for rf.nextIndex[notify.peer] < len(rf.Log) &&
+			if rf.nextIndex[notify.peer] > reply.FirstIndex {
+				rf.nextIndex[notify.peer] = reply.FirstIndex
+			}
+			// Check if we have dropped the log entry
+			for rf.FirstIndex < rf.nextIndex[notify.peer] &&
+				// Check if we've got some common prefixes
+				rf.nextIndex[notify.peer] < rf.FirstIndex+len(rf.Log) &&
+				// Skip matched indexes
 				(rf.nextIndex[notify.peer] < rf.matchIndex[notify.peer]+1 ||
-					rf.Log[rf.nextIndex[notify.peer]].Term == reply.ConflictTerm) {
+					rf.Log[rf.nextIndex[notify.peer]-rf.FirstIndex].Term == reply.ConflictTerm) {
 				rf.nextIndex[notify.peer]++
 			}
-			DPrintf("Server %d : nextIndex[%d] : now %d, len %d",
-				rf.me, notify.peer, rf.nextIndex[notify.peer], len(rf.Log))
+			// DPrintf("Server %d : nextIndex[%d] : now %d, len %d",
+			//   rf.me, notify.peer, rf.nextIndex[notify.peer], len(rf.Log))
 		}
 		// Retry if needed
 		if rf.matchIndex[notify.peer]+1 < rf.nextIndex[notify.peer] {
@@ -657,11 +675,11 @@ func appendEntryReplyHandler(rf *Raft, term int, args *AppendEntriesArgs, notify
 		return
 	}
 	// Update nextIndex, matchIndex and commitIndex
-	// Note : the current message may be outdated
+	// Note : check if the message is outdated
 	if rf.matchIndex[notify.peer] < args.PrevLogIndex+len(args.Entry) {
-		DPrintf("Server %d : nextIndex[%d] : was %d, now %d, len %d",
-			rf.me, notify.peer, rf.nextIndex[notify.peer],
-			args.PrevLogIndex+len(args.Entry)+1, len(rf.Log))
+		// DPrintf("Server %d : nextIndex[%d] : was %d, now %d, len %d",
+		//   rf.me, notify.peer, rf.nextIndex[notify.peer],
+		//   args.PrevLogIndex+len(args.Entry)+1, len(rf.Log))
 		rf.matchIndex[notify.peer] = args.PrevLogIndex + len(args.Entry)
 		if rf.matchIndex[notify.peer]+1 > rf.nextIndex[notify.peer] {
 			rf.nextIndex[notify.peer] = rf.matchIndex[notify.peer] + 1
@@ -735,10 +753,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Persistent
 	rf.CurrentTerm = 0
 	rf.VotedFor = -1
+	rf.FirstIndex = 0
 	rf.Log = make([]LogEntry, 1)
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 	// volatile
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	// We know that snapshot must have been commited
+	rf.commitIndex = rf.FirstIndex
+	rf.lastApplied = rf.FirstIndex
 	rf.applyCh = applyCh
 	rf.notifyChan = make(chan notifyEntry, len(rf.peers))
 
@@ -747,8 +769,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastActiveTime = time.Now()
 	rf.electTimeout = SetElectionTimeout()
 	rf.state = "Follower"
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	go Follower(rf.CurrentTerm, rf)
 	go Applier(rf)
